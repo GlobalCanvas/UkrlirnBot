@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ======================================================================
 
 # ТОКЕН БОТА
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133267244:AAEimjL3_gSTWiYV7bglcyrqGA2woQykDZo")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133267244:AAFPj7GcUhgUPUiuAxM9afwQFoSsB5hEtUc")
 
 # АВТОРИЗАЦІЯ (КРИТИЧНО ДЛЯ ФІКСА 401!)
 AUTH_COOKIE = os.environ.get("AUTH_COOKIE", "s%3AS2qBqqlzYPCWST-OalOz6svoEoTYQIi9.%2BL0JZVKMRNrHr9eQ8WAuf4D9MdthKJP3pHCrqliUmZs")
