@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ⚙️ КОНФІГУРАЦІЯ
 # ======================================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133267244:AAEimjL3_gSTWiYV7bglcyrqGA2woQykDZo")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133267244:AAFPj7GcUhgUPUiuAxM9afwQFoSsB5hEtUc")
 
 # COOKIES
 COOKIE_PIXELYA = "s%3AMiTkf-27ZLGgiV8Xt13qhsg6tGliAuLx.p64kN9RRkoAMMecownmgM1SiJmO67d4CuNR4nD3k1AM"
