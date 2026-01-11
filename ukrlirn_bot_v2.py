@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+# bot.py - UkrLirn Monitor Bot v2.0
+
+import sys
+import os
+import io
+import json
+import asyncio
+import logging
+import math
+from datetime import datetime
+import numpy as np
+import PIL.Image
+import aiohttp
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters
+)
+
+# --- ЛОГУВАННЯ ---
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ======================================================================
+# ⚙️ КОНФІГУРАЦІЯ
+# ======================================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8133267244:AAFPj7GcUhgUPUiuAxM9afwQFoSsB5hEtUc")
+
+# COOKIES
+COOKIE_PIXELYA = "s%3AgLVcmK9zi7AjIb8rAJX2oaGO0dB84GXi.UEhch5q%2BonqeRKk4wcHCx%2BEPsvYualKOJglhD5qiETM"
+COOKIE_PIXMAP = "s%3AmtHfgHOCBpgEI_f1q7-ZWOpwFWKfQHjT.30BFRaEsJeSJXo%2BbA6CPx4kv1V6Gwx4wssVIlV9Xtw0"
+COOKIE_PIXUNIVERS = "s%3Avwp64WhUKpDYEe0xic1bCvf2SwE9jsyu.9jYCpwgpg3rxKCZ7i6i2n0A93NJ0eZH8SqDdNHWRfR"
+
+CHUNK_SIZE = 256
+MAX_CONCURRENT = 20
+STATE_FILE = "state.json"
+TEMPLATE_FILE = "template.png"
+
+# Параметри сайтів
+SITES = {
+    "pixelya": {
+        "url": "https://pixelya.fun",
+        "chunk_url": "https://pixelya.fun/chunks/5/{x}/{y}.bmp",
+        "api_me": "https://pixelya.fun/api/me",
+        "api_faction": "https://pixelya.fun/api/faction/list",
+        "canvas_size": 65536,
+        "canvas_id": 5,
+        "faction_id": 359,
+        "cookie": f"pixelya.session={COOKIE_PIXELYA}"
+    },
+    "pixmap": {
+        "url": "https://pixmap.fun",
+        "chunk_url": "https://pixmap.fun/chunks/5/{x}/{y}.bmp",
+        "api_me": "https://pixmap.fun/api/me",
+        "api_faction": "https://pixmap.fun/api/faction/list",
+        "canvas_size": 65536,
+        "canvas_id": 5,
+        "faction_id": 530,
+        "cookie": f"ppfun.session={COOKIE_PIXMAP}"
+    },
+    "pixunivers": {
+        "url": "https://pixunivers.fun",
+        "chunk_url": "https://pixunivers.fun/chunks/0/{x}/{y}.bmp",
+        "api_me": "https://pixunivers.fun/api/me",
+        "api_faction": "https://pixunivers.fun/api/faction/list",
+        "canvas_size": 65536,
+        "canvas_id": 0,
+        "faction_id": 359,
+        "cookie": f"ppfun.session={COOKIE_PIXUNIVERS}"
+    }
+}
+
+# Стан
+state = {
+    "site": "pixelya",
+    "coords": [0, 0],
+    "colors": {},
+    "user_links": {},  # {telegram_id: nickname}
+    "medals": {},  # {telegram_id: [{name, weight, date}]}
+    "method": "numpy",  # numpy або chunks
+    "use_cookies": True,  # використовувати куки чи ні
+    "tolerance": 35.0
+}
+
+# ======================================================================
+# 🎨 ДВИЖОК
+# ======================================================================
+
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                loaded = json.load(f)
+                state.update(loaded)
+            logger.info(f"✅ Стан завантажено: {state['site']}, method={state.get('method', 'numpy')}")
+        except Exception as e:
+            logger.error(f"Помилка завантаження: {e}")
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Помилка збереження: {e}")
+
+
+async def fetch_canvas_colors(site_name):
+    """Отримує палітру кольорів з API"""
+    site = SITES[site_name]
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+    }
+    
+    if state.get("use_cookies", True):
+        headers['Cookie'] = site['cookie']
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(site['api_me'], headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    canvas = data['canvases'].get(str(site['canvas_id']))
+                    if canvas and 'colors' in canvas:
+                        colors = {}
+                        for i, color in enumerate(canvas['colors']):
+                            if len(color) == 3:
+                                colors[i] = tuple(color) + (255,)
+                            else:
+                                colors[i] = tuple(color)
+                        logger.info(f"✅ Завантажено {len(colors)} кольорів з canvas {site['canvas_id']}")
+                        return colors
+    except Exception as e:
+        logger.error(f"Помилка API: {e}")
+    
+    return {i: (i*10, i*10, i*10, 255) for i in range(32)}
+
+
+async def fetch_faction_data(site_name):
+    """Отримує дані фракції"""
+    site = SITES[site_name]
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+    }
+    
+    if state.get("use_cookies", True):
+        headers['Cookie'] = site['cookie']
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(site['api_faction'], headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    factions = await resp.json()
+                    for faction in factions:
+                        if faction.get("id") == site['faction_id']:
+                            return faction
+    except Exception as e:
+        logger.error(f"Помилка faction API: {e}")
+    return None
+
+
+async def fetch_chunk(session, url, headers, cx, cy, colors, sem):
+    """Читання чанку"""
+    async with sem:
+        try:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    
+                    if len(data) == 0:
+                        return PIL.Image.new('RGBA', (CHUNK_SIZE, CHUNK_SIZE), (0, 0, 0, 0))
+                    
+                    img = PIL.Image.new('RGBA', (CHUNK_SIZE, CHUNK_SIZE), (0, 0, 0, 0))
+                    pixels = img.load()
+                    
+                    for i, byte in enumerate(data[:CHUNK_SIZE*CHUNK_SIZE]):
+                        x = i % CHUNK_SIZE
+                        y = i // CHUNK_SIZE
+                        color_index = byte & 0x7F
+                        pixels[x, y] = colors.get(color_index, (0, 0, 0, 255))
+                    
+                    return img
+                
+                return PIL.Image.new('RGBA', (CHUNK_SIZE, CHUNK_SIZE), (0, 0, 0, 0))
+                    
+        except:
+            return PIL.Image.new('RGBA', (CHUNK_SIZE, CHUNK_SIZE), (0, 0, 0, 0))
+
+
+async def get_map_area(site_name, x, y, w, h, progress_msg=None):
+    """Завантажує область карти з прогрес-баром"""
+    site = SITES[site_name]
+    canvas_size = site["canvas_size"]
+    
+    if site_name not in state.get("colors", {}):
+        if progress_msg:
+            await progress_msg.edit_text("⏳ Завантажую палітру кольорів...")
+        colors = await fetch_canvas_colors(site_name)
+        if "colors" not in state:
+            state["colors"] = {}
+        state["colors"][site_name] = colors
+    else:
+        colors = state["colors"][site_name]
+    
+    canvasoffset = math.sqrt(canvas_size)
+    offset = int(-canvasoffset * canvasoffset / 2)
+    
+    cx_start = (x - offset) // CHUNK_SIZE
+    cx_end = (x + w - offset) // CHUNK_SIZE
+    cy_start = (y - offset) // CHUNK_SIZE
+    cy_end = (y + h - offset) // CHUNK_SIZE
+    
+    total_chunks = (cx_end - cx_start + 1) * (cy_end - cy_start + 1)
+    logger.info(f"🗺️ Чанки: X[{cx_start}..{cx_end}], Y[{cy_start}..{cy_end}], всього: {total_chunks}")
+    
+    canvas = PIL.Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'image/bmp,*/*'
+    }
+    
+    if state.get("use_cookies", True):
+        headers['Cookie'] = site['cookie']
+    
+    # Лічильник завантажених чанків
+    loaded_chunks = [0]
+    last_update = [0]
+    
+    async def update_progress():
+        """Оновлює прогрес-бар"""
+        if not progress_msg:
+            return
+        
+        current_time = asyncio.get_event_loop().time()
+        if current_time - last_update[0] < 2 and loaded_chunks[0] < total_chunks:
+            return
+        
+        last_update[0] = current_time
+        percent = (loaded_chunks[0] / total_chunks * 100)
+        filled = int(percent / 5)
+        bar = "🟩" * filled + "⬜" * (20 - filled)
+        
+        try:
+            await progress_msg.edit_text(
+                f"⏳ **Завантаження чанків**\n\n"
+                f"{bar}\n\n"
+                f"📦 {loaded_chunks[0]}/{total_chunks} ({percent:.1f}%)",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+    
+    async def fetch_with_progress(session, url, headers, cx, cy, colors, sem, canvas, px, py):
+        """Завантажує чанк і оновлює прогрес"""
+        img = await fetch_chunk(session, url, headers, cx, cy, colors, sem)
+        try:
+            canvas.paste(img, (px, py), img)
+        except Exception as e:
+            logger.error(f"Помилка paste [{cx},{cy}]: {e}")
+        
+        loaded_chunks[0] += 1
+        await update_progress()
+    
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for cy in range(cy_start, cy_end + 1):
+            for cx in range(cx_start, cx_end + 1):
+                url = site["chunk_url"].format(x=cx, y=cy)
+                px = (cx * CHUNK_SIZE + offset) - x
+                py = (cy * CHUNK_SIZE + offset) - y
+                tasks.append(fetch_with_progress(session, url, headers, cx, cy, colors, sem, canvas, px, py))
+        
+        await asyncio.gather(*tasks)
+    
+    if progress_msg:
+        await progress_msg.edit_text("✅ Завантаження завершено!")
+    
+    return canvas
+
+
+def compare_with_template_numpy(board, progress_msg=None):
+    """Порівнює з шаблоном (NumPy метод)"""
+    if not os.path.exists(TEMPLATE_FILE):
+        return None, None
+    
+    logger.info("📊 Початок порівняння (NumPy)...")
+    
+    tmpl = PIL.Image.open(TEMPLATE_FILE).convert("RGBA")
+    tw, th = tmpl.size
+    
+    if board.size != (tw, th):
+        board = board.crop((0, 0, min(tw, board.size[0]), min(th, board.size[1])))
+        if board.size != (tw, th):
+            temp = PIL.Image.new('RGBA', (tw, th), (0, 0, 0, 0))
+            temp.paste(board, (0, 0))
+            board = temp
+    
+    logger.info("📊 Конвертую в numpy...")
+    t_arr = np.array(tmpl, dtype=np.uint8)
+    b_arr = np.array(board, dtype=np.uint8)
+    
+    logger.info("📊 Обчислюю маску шаблону...")
+    template_mask = t_arr[:, :, 3] > 10
+    total = int(np.sum(template_mask))
+    
+    if total == 0:
+        return {"percent": 100, "errors": 0, "total": 0, "correct": 0}, tmpl
+    
+    logger.info(f"📊 Всього пікселів: {total:,}")
+    
+    board_mask = b_arr[:, :, 3] > 10
+    
+    logger.info("📊 Обчислюю різницю кольорів (Euclidean)...")
+    t_rgb = t_arr[:, :, :3].astype(np.float32)
+    b_rgb = b_arr[:, :, :3].astype(np.float32)
+    
+    color_distance = np.sqrt(np.sum((t_rgb - b_rgb) ** 2, axis=2))
+    
+    TOLERANCE = state.get("tolerance", 35.0)
+    color_match = color_distance <= TOLERANCE
+    
+    logger.info("📊 Обчислюю правильні та помилки...")
+    correct_mask = template_mask & board_mask & color_match
+    correct_count = int(np.sum(correct_mask))
+    
+    errors_mask = template_mask & ~(board_mask & color_match)
+    err_count = int(np.sum(errors_mask))
+    
+    percent = (correct_count / total * 100) if total > 0 else 0
+    
+    logger.info(f"📊 Результат: {correct_count:,}/{total:,} ({percent:.1f}%)")
+    
+    logger.info("📊 Створюю overlay...")
+    overlay = t_arr.copy()
+    
+    wrong_color_mask = template_mask & board_mask & ~color_match
+    overlay[wrong_color_mask] = [255, 0, 0, 255]
+    
+    missing_mask = template_mask & ~board_mask
+    overlay[missing_mask] = [255, 128, 0, 255]
+    
+    result = {
+        "percent": percent,
+        "errors": err_count,
+        "correct": correct_count,
+        "total": total,
+        "missing": int(np.sum(missing_mask)),
+        "wrong_color": int(np.sum(wrong_color_mask))
+    }
+    
+    logger.info("📊 Завершено!")
+    
+    return result, PIL.Image.fromarray(overlay)
+
+
+def compare_with_template_chunks(board, progress_msg=None):
+    """Порівнює з шаблоном (Chunks метод - попіксельно)"""
+    if not os.path.exists(TEMPLATE_FILE):
+        return None, None
+    
+    logger.info("📊 Початок порівняння (Chunks)...")
+    
+    tmpl = PIL.Image.open(TEMPLATE_FILE).convert("RGBA")
+    tw, th = tmpl.size
+    
+    if board.size != (tw, th):
+        board = board.crop((0, 0, min(tw, board.size[0]), min(th, board.size[1])))
+        if board.size != (tw, th):
+            temp = PIL.Image.new('RGBA', (tw, th), (0, 0, 0, 0))
+            temp.paste(board, (0, 0))
+            board = temp
+    
+    logger.info("📊 Читаю пікселі...")
+    t_pixels = tmpl.load()
+    b_pixels = board.load()
+    overlay = tmpl.copy()
+    o_pixels = overlay.load()
+    
+    total = 0
+    correct = 0
+    missing = 0
+    wrong_color = 0
+    
+    TOLERANCE = state.get("tolerance", 35.0)
+    
+    logger.info("📊 Обчислюю попіксельно...")
+    for y in range(th):
+        for x in range(tw):
+            t_pixel = t_pixels[x, y]
+            
+            # Перевіряємо чи піксель шаблону непрозорий
+            if t_pixel[3] <= 10:
+                continue
+            
+            total += 1
+            b_pixel = b_pixels[x, y]
+            
+            # Перевіряємо чи піксель є на дошці
+            if b_pixel[3] <= 10:
+                missing += 1
+                o_pixels[x, y] = (255, 128, 0, 255)  # Помаранчевий
+                continue
+            
+            # Обчислюємо різницю кольорів
+            dr = t_pixel[0] - b_pixel[0]
+            dg = t_pixel[1] - b_pixel[1]
+            db = t_pixel[2] - b_pixel[2]
+            distance = math.sqrt(dr*dr + dg*dg + db*db)
+            
+            if distance <= TOLERANCE:
+                correct += 1
+            else:
+                wrong_color += 1
+                o_pixels[x, y] = (255, 0, 0, 255)  # Червоний
+    
+    errors = total - correct
+    percent = (correct / total * 100) if total > 0 else 0
+    
+    logger.info(f"📊 Результат: {correct:,}/{total:,} ({percent:.1f}%)")
+    
+    result = {
+        "percent": percent,
+        "errors": errors,
+        "correct": correct,
+        "total": total,
+        "missing": missing,
+        "wrong_color": wrong_color
+    }
+    
+    logger.info("📊 Завершено!")
+    
+    return result, overlay
+
+
+# ======================================================================
+# 🤖 БОТ
+# ======================================================================
+
+UPLOAD_WAITING = 1
+
+async def start_cmd(u: Update, c):
+    await u.message.reply_text(
+        "🎨 **UkrLirn Monitor Bot v2.0**\n\n"
+        "**Шаблон:**\n"
+        "• `/upload` — завантажити\n"
+        "• `/get` — скачати шаблон\n"
+        "• `/set_coords X Y` — координати\n"
+        "• `/check` — прогрес\n\n"
+        "**Налаштування:**\n"
+        "• `/site <назва>` — сайт (pixelya/pixmap/pixunivers)\n"
+        "• `/method <тип>` — метод (numpy/chunks)\n"
+        "• `/cookie <on/off>` — використовувати куки\n"
+        "• `/tolerance <число>` — толеранс (25-50)\n"
+        "• `/status` — поточні налаштування\n\n"
+        "**Гравці:**\n"
+        "• `/connect <нік>` — прив'язати\n"
+        "• `/profile [нік]` — профіль\n\n"
+        "**Медалі:**\n"
+        "• `/madd <назва> <1-10>` (у відповідь)\n"
+        "• `/mdel <номер>` (у відповідь)\n\n"
+        "**Інше:**\n"
+        "• `/debug` — вигляд карти",
+        parse_mode="Markdown"
+    )
+
+
+async def status_cmd(u: Update, c):
+    x, y = state.get("coords", [0, 0])
+    has_template = os.path.exists(TEMPLATE_FILE)
+    method = state.get("method", "numpy")
+    use_cookies = state.get("use_cookies", True)
+    tolerance = state.get("tolerance", 35.0)
+    site = state['site']
+    
+    await u.message.reply_text(
+        f"⚙️ **Налаштування:**\n\n"
+        f"🌐 Сайт: `{site}`\n"
+        f"📐 Шаблон: {'✅' if has_template else '❌'}\n"
+        f"📍 Координати: `{x}_{y}`\n"
+        f"🏰 Фракція ID: {SITES[site]['faction_id']}\n"
+        f"⚡ Метод: `{method}`\n"
+        f"🍪 Куки: {'✅' if use_cookies else '❌'}\n"
+        f"🎯 Толеранс: `{tolerance}`",
+        parse_mode="Markdown"
+    )
+
+
+async def method_cmd(u: Update, c):
+    """Змінити метод порівняння"""
+    if not c.args or c.args[0] not in ["numpy", "chunks"]:
+        current = state.get("method", "numpy")
+        return await u.message.reply_text(
+            f"⚡ **Поточний метод:** `{current}`\n\n"
+            f"**numpy** — швидкий, використовує numpy arrays\n"
+            f"**chunks** — повільний, попіксельне порівняння\n\n"
+            f"Використання: `/method numpy` або `/method chunks`",
+            parse_mode="Markdown"
+        )
+    
+    method = c.args[0]
+    state["method"] = method
+    save_state()
+    
+    desc = "швидкий (numpy)" if method == "numpy" else "повільний (попіксельний)"
+    await u.message.reply_text(
+        f"✅ Метод змінено: **{method}** ({desc})",
+        parse_mode="Markdown"
+    )
+
+
+async def cookie_cmd(u: Update, c):
+    """Увімкнути/вимкнути куки"""
+    if not c.args or c.args[0] not in ["on", "off"]:
+        current = state.get("use_cookies", True)
+        status = "увімкнені ✅" if current else "вимкнені ❌"
+        return await u.message.reply_text(
+            f"🍪 **Куки:** {status}\n\n"
+            f"Використання: `/cookie on` або `/cookie off`",
+            parse_mode="Markdown"
+        )
+    
+    use_cookies = c.args[0] == "on"
+    state["use_cookies"] = use_cookies
+    save_state()
+    
+    status = "увімкнені ✅" if use_cookies else "вимкнені ❌"
+    await u.message.reply_text(
+        f"✅ Куки {status}",
+        parse_mode="Markdown"
+    )
+
+
+async def tolerance_cmd(u: Update, c):
+    """Встановити толеранс"""
+    if not c.args or len(c.args) != 1:
+        current = state.get("tolerance", 35.0)
+        return await u.message.reply_text(
+            f"🎯 **Поточний толеранс:** `{current}`\n\n"
+            f"Використання: `/tolerance <значення>`\n"
+            f"Рекомендовано: 25-50\n"
+            f"(більше = м'якше порівняння)",
+            parse_mode="Markdown"
+        )
+    
+    try:
+        tolerance = float(c.args[0])
+        if tolerance < 0 or tolerance > 100:
+            raise ValueError
+        state["tolerance"] = tolerance
+        save_state()
+        await u.message.reply_text(
+            f"✅ Толеранс встановлено: `{tolerance}`",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await u.message.reply_text("❌ Значення має бути 0-100")
+
+
+async def get_template_cmd(u: Update, c):
+    """Отримати шаблон"""
+    if not os.path.exists(TEMPLATE_FILE):
+        return await u.message.reply_text("❌ Шаблон відсутній!")
+    
+    x, y = state.get("coords", [0, 0])
+    coords_str = f"{x}_{y}"
+    
+    img = PIL.Image.open(TEMPLATE_FILE)
+    caption = (
+        f"📐 **Шаблон UkrLirn**\n\n"
+        f"📍 Координати: `{coords_str}`\n"
+        f"📏 Розмір: `{img.size[0]}x{img.size[1]}` px\n"
+        f"🌐 Сайт: {state['site']}"
+    )
+    
+    with open(TEMPLATE_FILE, "rb") as f:
+        await u.message.reply_document(
+            document=f,
+            caption=caption,
+            parse_mode="Markdown",
+            filename="ukrlirn_template.png"
+        )
+
+
+async def check_cmd(u: Update, c):
+    """Перевірка прогресу"""
+    if not os.path.exists(TEMPLATE_FILE):
+        return await u.message.reply_text("❌ Завантаж шаблон: `/upload`", parse_mode="Markdown")
+    
+    msg = await u.message.reply_text("⏳ Підготовка...")
+    
+    try:
+        with PIL.Image.open(TEMPLATE_FILE) as tmpl:
+            w, h = tmpl.size
+        
+        x, y = state["coords"]
+        method = state.get("method", "numpy")
+        logger.info(f"🎬 Перевірка: {state['site']}, ({x},{y}), {w}x{h}, method={method}")
+        
+        board = await get_map_area(state["site"], x, y, w, h, progress_msg=msg)
+        
+        await msg.edit_text(f"⏳ Порівнюю з шаблоном ({method})...")
+        
+        loop = asyncio.get_event_loop()
+        if method == "numpy":
+            result, overlay = await loop.run_in_executor(None, compare_with_template_numpy, board, msg)
+        else:
+            result, overlay = await loop.run_in_executor(None, compare_with_template_chunks, board, msg)
+        
+        if result:
+            await msg.edit_text("⏳ Створюю звіт...")
+            
+            bio = io.BytesIO()
+            overlay.save(bio, 'PNG')
+            bio.seek(0)
+            
+            coords_str = f"{x}_{y}"
+            percent = result['percent']
+            filled = int(percent / 5)
+            bar = "🟩" * filled + "⬜" * (20 - filled)
+            
+            caption = (
+                f"📊 **Прогрес UkrLirn**\n\n"
+                f"🌐 Сайт: {state['site']}\n"
+                f"📍 Координати: `{coords_str}`\n"
+                f"⚡ Метод: `{method}`\n\n"
+                f"{bar}\n"
+                f"📈 **Готовність: {percent:.2f}%**\n\n"
+                f"🎯 Всього: `{result['total']:,}` px\n"
+                f"✅ Правильно: `{result['correct']:,}` px\n"
+                f"❌ Помилок: `{result['errors']:,}` px\n"
+                f"  ├─ 🟠 Відсутні: `{result.get('missing', 0):,}` px\n"
+                f"  └─ 🔴 Неправильні: `{result.get('wrong_color', 0):,}` px\n\n"
+                f"_🔴 Червоний = неправильний колір_\n"
+                f"_🟠 Помаранчевий = відсутній піксель_"
+            )
+            
+            await u.message.reply_document(
+                document=bio,
+                caption=caption,
+                parse_mode="Markdown",
+                filename=f"progress_{coords_str}.png"
+            )
+            await msg.delete()
+        else:
+            await msg.edit_text("❌ Помилка порівняння")
+            
+    except Exception as e:
+        logger.error(f"Помилка check: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Помилка: `{str(e)}`", parse_mode="Markdown")
+
+
+async def debug_cmd(u: Update, c):
+    """Debug вигляд"""
+    if not os.path.exists(TEMPLATE_FILE):
+        return await u.message.reply_text("❌ Потрібен шаблон")
+    
+    msg = await u.message.reply_text("👁️ Підготовка...")
+    
+    try:
+        with PIL.Image.open(TEMPLATE_FILE) as tmpl:
+            w, h = tmpl.size
+        
+        x, y = state["coords"]
+        board = await get_map_area(state["site"], x, y, w, h, progress_msg=msg)
+        
+        await msg.edit_text("⏳ Створюю зображення...")
+        
+        bio = io.BytesIO()
+        board.save(bio, 'PNG')
+        bio.seek(0)
+        
+        await u.message.reply_photo(bio, caption=f"🗺️ Debug\n{state['site']} ({x}_{y})")
+        await msg.delete()
+        
+    except Exception as e:
+        logger.error(f"Debug error: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Помилка: {e}")
+
+
+async def set_coords_cmd(u: Update, c):
+    """Встановити координати"""
+    try:
+        if len(c.args) != 2:
+            raise ValueError
+        x, y = int(c.args[0]), int(c.args[1])
+        state["coords"] = [x, y]
+        save_state()
+        await u.message.reply_text(f"✅ Координати: `{x}_{y}`", parse_mode="Markdown")
+    except:
+        await u.message.reply_text("⚠️ Формат: `/set_coords X Y`", parse_mode="Markdown")
+
+
+async def set_site_cmd(u: Update, c):
+    """Змінити сайт"""
+    if c.args and c.args[0] in SITES:
+        state["site"] = c.args[0]
+        save_state()
+        await u.message.reply_text(f"✅ Сайт: **{state['site']}**", parse_mode="Markdown")
+    else:
+        sites = ", ".join(SITES.keys())
+        await u.message.reply_text(f"⚠️ Доступні: {sites}")
+
+
+async def connect_cmd(u: Update, c):
+    """Прив'язати профіль"""
+    if not c.args:
+        return await u.message.reply_text("⚠️ `/connect <нік>`", parse_mode="Markdown")
+    
+    nick = " ".join(c.args)
+    user_id = str(u.effective_user.id)
+    state["user_links"][user_id] = nick
+    save_state()
+    await u.message.reply_text(f"✅ Прив'язано: **{nick}**", parse_mode="Markdown")
+
+
+async def profile_cmd(u: Update, c):
+    """Профіль гравця"""
+    user_id = str(u.effective_user.id)
+    
+    if c.args:
+        nick = " ".join(c.args)
+        target_id = None
+        for uid, n in state["user_links"].items():
+            if n.lower() == nick.lower():
+                target_id = uid
+                break
+    else:
+        nick = state["user_links"].get(user_id)
+        target_id = user_id
+        
+        if not nick:
+            return await u.message.reply_text("⚠️ `/connect <нік>`", parse_mode="Markdown")
+    
+    msg = await u.message.reply_text("🔍 Завантажую...")
+    
+    try:
+        faction_data = await fetch_faction_data(state["site"])
+        if not faction_data:
+            return await msg.edit_text("❌ Не вдалось завантажити дані фракції")
+        
+        found = None
+        for member in faction_data.get("members", []):
+            if member.get("name", "").lower() == nick.lower():
+                found = member
+                break
+        
+        if not found:
+            return await msg.edit_text(f"❌ **{nick}** не знайдений", parse_mode="Markdown")
+        
+        pixels = found.get("totalPixels", 0)
+        daily = found.get("dailyPixels", 0)
+        role = found.get("role", "member")
+        
+        medals_text = ""
+        if target_id and target_id in state.get("medals", {}):
+            medals_text = "\n\n🏅 **Медалі:**\n"
+            for i, m in enumerate(state["medals"][target_id], 1):
+                stars = "⭐" * m["weight"]
+                medals_text += f"{i}. {m['name']} {stars}\n"
+        
+        txt = (
+            f"👤 **{found['name']}**\n\n"
+            f"📌 Всього: `{pixels:,}` px\n"
+            f"📅 Сьогодні: `{daily:,}` px\n"
+            f"👑 Роль: {role}"
+        )
+        txt += medals_text
+        
+        await msg.edit_text(txt, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Помилка profile: {e}", exc_info=True)
+        await msg.edit_text(f"❌ `{str(e)}`", parse_mode="Markdown")
+
+
+async def add_medal_cmd(u: Update, c):
+    """Додати медаль"""
+    if not u.message.reply_to_message:
+        return await u.message.reply_text(
+            "⚠️ Відповідай на повідомлення!\n`/madd <назва> <1-10>`",
+            parse_mode="Markdown"
+        )
+    
+    if not c.args or len(c.args) < 2:
+        return await u.message.reply_text(
+            "⚠️ `/madd <назва> <вага>`\n\nПриклад: `/madd Художник 10`",
+            parse_mode="Markdown"
+        )
+    
+    try:
+        weight = int(c.args[-1])
+        if weight < 1 or weight > 10:
+            raise ValueError
+        name = " ".join(c.args[:-1])
+    except ValueError:
+        return await u.message.reply_text("❌ Вага 1-10!")
+    
+    target_id = str(u.message.reply_to_message.from_user.id)
+    
+    if "medals" not in state:
+        state["medals"] = {}
+    if target_id not in state["medals"]:
+        state["medals"][target_id] = []
+    
+    state["medals"][target_id].append({
+        "name": name,
+        "weight": weight,
+        "date": datetime.now().strftime("%Y-%m-%d")
+    })
+    save_state()
+    
+    stars = "⭐" * weight
+    await u.message.reply_text(
+        f"✅ Медаль додано!\n\n🏅 **{name}** {stars}",
+        parse_mode="Markdown"
+    )
+
+
+async def del_medal_cmd(u: Update, c):
+    """Видалити медаль"""
+    if not u.message.reply_to_message:
+        return await u.message.reply_text(
+            "⚠️ Відповідай на повідомлення!\n`/mdel <номер>`",
+            parse_mode="Markdown"
+        )
+    
+    if not c.args or len(c.args) != 1:
+        return await u.message.reply_text("⚠️ `/mdel <номер>`", parse_mode="Markdown")
+    
+    try:
+        index = int(c.args[0]) - 1
+    except ValueError:
+        return await u.message.reply_text("❌ Номер має бути числом!")
+    
+    target_id = str(u.message.reply_to_message.from_user.id)
+    
+    if target_id not in state.get("medals", {}) or not state["medals"][target_id]:
+        return await u.message.reply_text("❌ Немає медалей!")
+    
+    if index < 0 or index >= len(state["medals"][target_id]):
+        return await u.message.reply_text("❌ Медалі з таким номером не існує!")
+    
+    removed = state["medals"][target_id].pop(index)
+    save_state()
+    
+    await u.message.reply_text(
+        f"✅ Видалено: 🏅 {removed['name']}",
+        parse_mode="Markdown"
+    )
+
+
+async def upload_start(u: Update, c):
+    await u.message.reply_text("📤 Надішли PNG файл шаблону:")
+    return UPLOAD_WAITING
+
+
+async def upload_file(u: Update, c):
+    doc = u.message.document
+    if not doc or not doc.file_name.lower().endswith('.png'):
+        await u.message.reply_text("❌ Потрібен PNG!")
+        return ConversationHandler.END
+    
+    file = await doc.get_file()
+    await file.download_to_drive(TEMPLATE_FILE)
+    
+    img = PIL.Image.open(TEMPLATE_FILE)
+    await u.message.reply_text(
+        f"✅ Шаблон завантажено: `{img.size[0]}x{img.size[1]}` px",
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+
+async def cancel_upload(u: Update, c):
+    await u.message.reply_text("❌ Скасовано")
+    return ConversationHandler.END
+
+
+# ======================================================================
+# 🚀 ЗАПУСК
+# ======================================================================
+
+def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не встановлено!")
+        sys.exit(1)
+    
+    load_state()
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    upload_conv = ConversationHandler(
+        entry_points=[CommandHandler("upload", upload_start)],
+        states={
+            UPLOAD_WAITING: [MessageHandler(filters.Document.ALL, upload_file)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_upload)]
+    )
+    
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
+    app.add_handler(CommandHandler("get", get_template_cmd))
+    app.add_handler(CommandHandler("set_coords", set_coords_cmd))
+    app.add_handler(CommandHandler("site", set_site_cmd))
+    app.add_handler(CommandHandler("method", method_cmd))
+    app.add_handler(CommandHandler("cookie", cookie_cmd))
+    app.add_handler(CommandHandler("tolerance", tolerance_cmd))
+    app.add_handler(CommandHandler("connect", connect_cmd))
+    app.add_handler(CommandHandler("profile", profile_cmd))
+    app.add_handler(CommandHandler("madd", add_medal_cmd))
+    app.add_handler(CommandHandler("mdel", del_medal_cmd))
+    app.add_handler(upload_conv)
+    
+    logger.info("=" * 60)
+    logger.info("🤖 UkrLirn Monitor Bot v2.0 запущено!")
+    logger.info("=" * 60)
+    logger.info(f"🌐 Сайт: {state['site']}")
+    logger.info(f"⚡ Метод: {state.get('method', 'numpy')}")
+    logger.info(f"🍪 Куки: {'✅' if state.get('use_cookies', True) else '❌'}")
+    logger.info(f"🎯 Толеранс: {state.get('tolerance', 35.0)}")
+    logger.info(f"🏰 Фракція ID: {SITES[state['site']]['faction_id']}")
+    logger.info("=" * 60)
+    
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
